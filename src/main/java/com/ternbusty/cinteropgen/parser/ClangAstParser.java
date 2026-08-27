@@ -14,8 +14,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -85,8 +87,19 @@ public class ClangAstParser {
         var functions = new ArrayList<FunctionDecl>();
         var enums = new ArrayList<EnumDecl>();
         var typedefs = new ArrayList<TypedefDecl>();
+        var functionPointers = new ArrayList<FunctionPointerDecl>();
         var seenStructs = new HashSet<String>();
         var seenEnums = new HashSet<String>();
+
+        // Pre-build id→node map for looking up anonymous declarations.
+        var nodeById = new HashMap<String, JsonObject>();
+        for (var element : inner) {
+            var node = element.getAsJsonObject();
+            var id = optStr(node, "id");
+            if (id != null) {
+                nodeById.put(id, node);
+            }
+        }
 
         // clang's JSON AST only records "file" in loc for the first
         // declaration in each file. Subsequent declarations in the same
@@ -128,10 +141,16 @@ public class ClangAstParser {
                 case "TypedefDecl" -> {
                     var td = parseTypedef(node);
                     if (td != null) {
+                        // Detect function pointer typedef.
+                        var fp = detectFunctionPointerTypedef(td);
+                        if (fp != null) {
+                            functionPointers.add(fp);
+                        }
+
                         typedefs.add(td);
-                        // If typedef wraps an anonymous struct/enum, register
-                        // it under the typedef name.
-                        handleAnonymousTypedef(node, td, structs, enums, seenStructs, seenEnums);
+                        handleAnonymousTypedef(
+                                node, td, nodeById,
+                                structs, enums, seenStructs, seenEnums);
                     }
                 }
             }
@@ -145,7 +164,8 @@ public class ClangAstParser {
                 ? fileName.substring(0, fileName.lastIndexOf('.'))
                 : fileName;
 
-        return new Header(name, structs, functions, enums, constants, typedefs);
+        return new Header(name, structs, functions, enums, constants,
+                typedefs, functionPointers);
     }
 
     // ── loc tracking ─────────────────────────────────────────────
@@ -182,25 +202,55 @@ public class ClangAstParser {
 
         if (!node.has("completeDefinition") ||
                 !node.get("completeDefinition").getAsBoolean()) {
-            // Forward declaration.
             return name.isEmpty() ? null : new StructDecl(name, List.of(), isUnion);
         }
 
+        var fields = parseFields(node);
+        return new StructDecl(name, fields, isUnion);
+    }
+
+    private List<StructField> parseFields(JsonObject recordNode) {
         var fields = new ArrayList<StructField>();
-        var inner = node.getAsJsonArray("inner");
+        var inner = recordNode.getAsJsonArray("inner");
         if (inner != null) {
             for (var child : inner) {
                 var c = child.getAsJsonObject();
                 if ("FieldDecl".equals(str(c, "kind"))) {
+                    boolean isBitfield = c.has("isBitfield")
+                            && c.get("isBitfield").getAsBoolean();
+                    int bitWidth = 0;
+                    if (isBitfield) {
+                        // The bit width is in an inner ConstantExpr or
+                        // IntegerLiteral node.
+                        bitWidth = extractBitWidth(c);
+                    }
                     fields.add(new StructField(
                             str(c, "name"),
-                            qualType(c)
+                            qualType(c),
+                            isBitfield,
+                            bitWidth
                     ));
                 }
             }
         }
+        return fields;
+    }
 
-        return new StructDecl(name, fields, isUnion);
+    private int extractBitWidth(JsonObject fieldDecl) {
+        var inner = fieldDecl.getAsJsonArray("inner");
+        if (inner == null) return 0;
+        for (var child : inner) {
+            var c = child.getAsJsonObject();
+            var val = optStr(c, "value");
+            if (val != null) {
+                try { return Integer.parseInt(val); }
+                catch (NumberFormatException ignored) {}
+            }
+            // Recurse.
+            int nested = extractBitWidth(c);
+            if (nested > 0) return nested;
+        }
+        return 0;
     }
 
     // ── Function ─────────────────────────────────────────────────
@@ -236,8 +286,6 @@ public class ClangAstParser {
      * Format: "return_type (param_types)".
      */
     public static String extractReturnType(String funcQualType) {
-        // Find the last '(' at the function-type level.
-        // Handle cases like "struct point *(int, int)" or "void (*)(int)".
         int depth = 0;
         for (int i = funcQualType.length() - 1; i >= 0; i--) {
             char ch = funcQualType.charAt(i);
@@ -256,9 +304,13 @@ public class ClangAstParser {
 
     private EnumDecl parseEnum(JsonObject node) {
         var name = str(node, "name");
-        var constants = new ArrayList<EnumConstant>();
+        var constants = parseEnumConstants(node);
+        return new EnumDecl(name, constants);
+    }
 
-        var inner = node.getAsJsonArray("inner");
+    private List<EnumConstant> parseEnumConstants(JsonObject enumNode) {
+        var constants = new ArrayList<EnumConstant>();
+        var inner = enumNode.getAsJsonArray("inner");
         if (inner != null) {
             for (var child : inner) {
                 var c = child.getAsJsonObject();
@@ -268,23 +320,19 @@ public class ClangAstParser {
                 }
             }
         }
-
-        return new EnumDecl(name, constants);
+        return constants;
     }
 
     private long extractEnumValue(JsonObject enumConst) {
-        // Look for ConstantExpr or ImplicitValueInitExpr with a value.
         var inner = enumConst.getAsJsonArray("inner");
         if (inner != null) {
             for (var child : inner) {
                 var c = child.getAsJsonObject();
                 var val = optStr(c, "value");
                 if (val != null) {
-                    try {
-                        return Long.parseLong(val);
-                    } catch (NumberFormatException ignored) {}
+                    try { return Long.parseLong(val); }
+                    catch (NumberFormatException ignored) {}
                 }
-                // Recurse into nested exprs.
                 long nested = extractEnumValue(c);
                 if (nested != Long.MIN_VALUE) return nested;
             }
@@ -300,97 +348,105 @@ public class ClangAstParser {
         return new TypedefDecl(name, qualType(node));
     }
 
+    /**
+     * If a typedef has an ownedTagDecl pointing to an anonymous
+     * struct/enum, register the anonymous type under the typedef name.
+     *
+     * clang emits the anonymous RecordDecl/EnumDecl as a sibling node
+     * before the TypedefDecl. We look it up via the pre-built id→node
+     * map.
+     */
     private void handleAnonymousTypedef(
-            JsonObject node, TypedefDecl td,
+            JsonObject typedefNode, TypedefDecl td,
+            Map<String, JsonObject> nodeById,
             List<StructDecl> structs, List<EnumDecl> enums,
             Set<String> seenStructs, Set<String> seenEnums) {
-        var inner = node.getAsJsonArray("inner");
+        var inner = typedefNode.getAsJsonArray("inner");
         if (inner == null) return;
+
         for (var child : inner) {
             var c = child.getAsJsonObject();
             var kind = str(c, "kind");
 
-            // Walk through ElaboratedType / RecordType to find the actual record.
             if ("ElaboratedType".equals(kind)) {
-                // Check for ownedTagDecl (inline struct/enum in typedef).
                 var owned = c.getAsJsonObject("ownedTagDecl");
-                if (owned != null) {
-                    var tagKind = str(owned, "kind");
-                    var tagName = str(owned, "name");
-                    if (tagName.isEmpty()) {
-                        // Anonymous: use typedef name.
-                        if ("RecordDecl".equals(tagKind)) {
-                            var id = str(owned, "id");
-                            var anon = findRecordById(node, id);
-                            if (anon != null && seenStructs.add(td.name())) {
-                                boolean isUnion = "union".equals(str(anon, "tagUsed"));
-                                var fields = new ArrayList<StructField>();
-                                var fInner = anon.getAsJsonArray("inner");
-                                if (fInner != null) {
-                                    for (var f : fInner) {
-                                        var fo = f.getAsJsonObject();
-                                        if ("FieldDecl".equals(str(fo, "kind"))) {
-                                            fields.add(new StructField(str(fo, "name"), qualType(fo)));
-                                        }
-                                    }
-                                }
-                                structs.add(new StructDecl(td.name(), fields, isUnion));
-                            }
-                        } else if ("EnumDecl".equals(tagKind)) {
-                            var id = str(owned, "id");
-                            var anon = findEnumById(node, id);
-                            if (anon != null && seenEnums.add(td.name())) {
-                                enums.add(parseEnumWithName(anon, td.name()));
-                            }
-                        }
-                    }
+                if (owned == null) continue;
+
+                var tagKind = str(owned, "kind");
+                var tagName = str(owned, "name");
+                if (!tagName.isEmpty()) continue; // Named tag; not anonymous.
+
+                var tagId = str(owned, "id");
+                if (tagId.isEmpty()) continue;
+
+                // Look up the full declaration from the sibling nodes.
+                var fullDecl = nodeById.get(tagId);
+                if (fullDecl == null) continue;
+
+                if ("RecordDecl".equals(tagKind) && seenStructs.add(td.name())) {
+                    boolean isUnion = "union".equals(str(fullDecl, "tagUsed"));
+                    var fields = parseFields(fullDecl);
+                    structs.add(new StructDecl(td.name(), fields, isUnion));
+                } else if ("EnumDecl".equals(tagKind) && seenEnums.add(td.name())) {
+                    var constants = parseEnumConstants(fullDecl);
+                    enums.add(new EnumDecl(td.name(), constants));
                 }
             }
         }
+    }
+
+    // ── Function pointer typedef detection ───────────────────────
+
+    /**
+     * Detect if a typedef is a function pointer, e.g.
+     * {@code typedef void (*callback_fn)(int, const char *)}.
+     *
+     * The qualType will be {@code "void (*)(int, const char *)"}.
+     */
+    private FunctionPointerDecl detectFunctionPointerTypedef(TypedefDecl td) {
+        var qt = td.underlyingQualType();
+        int parenStar = qt.indexOf("(*)");
+        if (parenStar < 0) return null;
+
+        var retType = qt.substring(0, parenStar).strip();
+        var rest = qt.substring(parenStar + 3).strip();
+
+        if (!rest.startsWith("(") || !rest.endsWith(")")) return null;
+        var paramStr = rest.substring(1, rest.length() - 1).strip();
+
+        var params = new ArrayList<FunctionParam>();
+        if (!paramStr.isEmpty() && !paramStr.equals("void")) {
+            var paramTypes = splitByTopLevelComma(paramStr);
+            for (int i = 0; i < paramTypes.size(); i++) {
+                params.add(new FunctionParam("arg" + i, paramTypes.get(i).strip()));
+            }
+        }
+
+        return new FunctionPointerDecl(td.name(), retType, params);
     }
 
     /**
-     * Search siblings (preceding declarations at the same level) for a
-     * RecordDecl with the given id. In practice, an anonymous struct
-     * defined inside a typedef appears as a sibling right before the
-     * TypedefDecl in clang's AST.
+     * Split a string by commas, respecting nested parentheses.
      */
-    private JsonObject findRecordById(JsonObject typedefNode, String id) {
-        // The anonymous RecordDecl is emitted as a sibling in the
-        // TranslationUnit's inner array, not inside the TypedefDecl.
-        // We stashed the parent in the walk loop, so look at our
-        // preceding sibling. Since we don't have direct parent access
-        // here, parse the inner of the typedef itself.
-        return findDeclById(typedefNode, id, "RecordDecl");
-    }
-
-    private JsonObject findEnumById(JsonObject typedefNode, String id) {
-        return findDeclById(typedefNode, id, "EnumDecl");
-    }
-
-    private JsonObject findDeclById(JsonObject parent, String id, String expectedKind) {
-        // Not found within typedef; the caller should look at siblings.
-        return null;
-    }
-
-    private EnumDecl parseEnumWithName(JsonObject node, String name) {
-        var constants = new ArrayList<EnumConstant>();
-        var inner = node.getAsJsonArray("inner");
-        if (inner != null) {
-            for (var child : inner) {
-                var c = child.getAsJsonObject();
-                if ("EnumConstantDecl".equals(str(c, "kind"))) {
-                    long value = extractEnumValue(c);
-                    constants.add(new EnumConstant(str(c, "name"), value));
-                }
+    static List<String> splitByTopLevelComma(String s) {
+        var result = new ArrayList<String>();
+        int depth = 0;
+        int start = 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == ',' && depth == 0) {
+                result.add(s.substring(start, i).strip());
+                start = i + 1;
             }
         }
-        return new EnumDecl(name, constants);
+        result.add(s.substring(start).strip());
+        return result;
     }
 
     // ── Macro extraction ─────────────────────────────────────────
 
-    // Pattern: #define NAME value (simple object-like macros).
     private static final Pattern MACRO_PATTERN =
             Pattern.compile("^\\s*#\\s*define\\s+(\\w+)\\s+(.+)$");
 
@@ -403,13 +459,10 @@ public class ClangAstParser {
             var name = m.group(1);
             var value = m.group(2).trim();
 
-            // Skip include guards, internal macros, function-like macros.
             if (name.startsWith("_") || name.endsWith("_H") || name.endsWith("_H_"))
                 continue;
-            // Skip if value looks like a macro invocation or complex expr.
             if (value.contains("(") || value.contains("\\")) continue;
 
-            // Only keep numeric or string literals.
             var cleaned = value.replaceAll("[uUlLfF]$", "");
             boolean isNumeric = false;
             try {

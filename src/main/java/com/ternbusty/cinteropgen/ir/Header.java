@@ -14,11 +14,12 @@ public record Header(
         List<FunctionDecl> functions,
         List<EnumDecl> enums,
         List<MacroConstant> constants,
-        List<TypedefDecl> typedefs
+        List<TypedefDecl> typedefs,
+        List<FunctionPointerDecl> functionPointers
 ) {
     public record StructDecl(String name, List<StructField> fields, boolean isUnion) {}
 
-    public record StructField(String name, String qualType) {}
+    public record StructField(String name, String qualType, boolean isBitfield, int bitWidth) {}
 
     public record FunctionDecl(
             String name,
@@ -36,4 +37,13 @@ public record Header(
     public record MacroConstant(String name, String value) {}
 
     public record TypedefDecl(String name, String underlyingQualType) {}
+
+    /**
+     * A function pointer typedef, e.g. {@code typedef void (*callback_fn)(int, const char *)}.
+     */
+    public record FunctionPointerDecl(
+            String name,
+            String returnQualType,
+            List<FunctionParam> params
+    ) {}
 }

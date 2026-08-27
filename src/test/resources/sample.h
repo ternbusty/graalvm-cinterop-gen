@@ -54,6 +54,13 @@ union number {
     double d;
 };
 
+/* Bitfield struct */
+struct flags {
+    unsigned read  : 1;
+    unsigned write : 1;
+    unsigned exec  : 1;
+};
+
 int   sample_add(int a, int b);
 void  sample_greet(const char *name);
 void *sample_alloc(size_t size);
@@ -68,5 +75,8 @@ typedef void (*callback_fn)(int code, const char *msg);
 void  sample_register_callback(callback_fn cb);
 
 int32_t sample_checksum(const uint8_t *data, size_t len);
+
+/* Double pointer to struct (for @CPointerTo) */
+int   sample_find_points(struct point **out, int max);
 
 #endif /* SAMPLE_H */

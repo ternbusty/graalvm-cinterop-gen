@@ -1,17 +1,14 @@
 package com.ternbusty.cinteropgen.mapper;
 
 import java.util.Map;
-import java.util.regex.Pattern;
+import java.util.Set;
 
 /**
  * Map C type strings (qualType from clang's AST) to GraalVM CInterop
  * Java type names.
- *
- * The mapping follows SubstrateVM's CInterop documentation.
  */
 public class TypeMapper {
 
-    // Known word-sized typedefs.
     private static final Map<String, String> WORD_TYPES = Map.of(
             "size_t", "UnsignedWord",
             "ssize_t", "SignedWord",
@@ -20,7 +17,6 @@ public class TypeMapper {
             "ptrdiff_t", "SignedWord"
     );
 
-    // Fixed-width integer typedefs.
     private static final Map<String, String> FIXED_WIDTH = Map.ofEntries(
             Map.entry("int8_t", "byte"),
             Map.entry("uint8_t", "byte"),
@@ -42,7 +38,6 @@ public class TypeMapper {
             Map.entry("__off_t", "long")
     );
 
-    // Primitive C type names → Java.
     private static final Map<String, String> PRIMITIVES = Map.ofEntries(
             Map.entry("void", "void"),
             Map.entry("_Bool", "boolean"),
@@ -53,6 +48,7 @@ public class TypeMapper {
             Map.entry("unsigned short", "short"),
             Map.entry("int", "int"),
             Map.entry("unsigned int", "int"),
+            Map.entry("unsigned", "int"),
             Map.entry("long", "long"),
             Map.entry("unsigned long", "long"),
             Map.entry("long long", "long"),
@@ -62,14 +58,25 @@ public class TypeMapper {
             Map.entry("long double", "double")
     );
 
-    /**
-     * Map a C qualType string to its GraalVM CInterop Java type name.
-     */
+    /** Known function pointer typedef names (mapped to PascalCase interfaces). */
+    private final Set<String> functionPointerNames;
+
+    public TypeMapper() {
+        this(Set.of());
+    }
+
+    public TypeMapper(Set<String> functionPointerNames) {
+        this.functionPointerNames = functionPointerNames;
+    }
+
     public String map(String qualType) {
         var qt = qualType.strip();
-
-        // Strip leading "const " / "volatile " / "restrict ".
         qt = stripQualifiers(qt);
+
+        // Function pointer typedef → generated interface name.
+        if (functionPointerNames.contains(qt)) {
+            return toPascalCase(qt);
+        }
 
         // Word-sized types.
         var word = WORD_TYPES.get(qt);
@@ -84,64 +91,59 @@ public class TypeMapper {
             return mapPointer(qt);
         }
 
-        // Array types: "type [N]" → treat as pointer.
+        // Array types: "type [N]" → pointer.
         if (qt.contains("[")) {
             var elemType = qt.substring(0, qt.indexOf('[')).strip();
             return mapPointerToElem(elemType);
         }
 
         // Struct/union reference.
-        if (qt.startsWith("struct ")) {
-            return toPascalCase(qt.substring(7).strip());
-        }
-        if (qt.startsWith("union ")) {
-            return toPascalCase(qt.substring(6).strip());
-        }
+        if (qt.startsWith("struct ")) return toPascalCase(qt.substring(7).strip());
+        if (qt.startsWith("union ")) return toPascalCase(qt.substring(6).strip());
 
         // Enum → int.
-        if (qt.startsWith("enum ")) {
-            return "int";
-        }
+        if (qt.startsWith("enum ")) return "int";
 
         // Primitive.
         var prim = PRIMITIVES.get(qt);
         if (prim != null) return prim;
 
-        // Function pointer: "type (*)(params)" or similar.
-        if (qt.contains("(*)")) {
-            return "PointerBase";
-        }
+        // Function pointer: "type (*)(params)".
+        if (qt.contains("(*)")) return "PointerBase";
 
-        // Unknown typedef / type.  Try FIXED_WIDTH one more time
-        // after stripping any trailing space.
+        // Final fallback for FIXED_WIDTH.
         fw = FIXED_WIDTH.get(qt.strip());
         if (fw != null) return fw;
 
-        // Default to PointerBase for unknown.
         return "PointerBase";
     }
 
+    /**
+     * Check whether a qualType denotes a struct value (not a pointer).
+     * Used to warn about by-value struct returns.
+     */
+    public boolean isStructByValue(String qualType) {
+        var qt = stripQualifiers(qualType.strip());
+        return qt.startsWith("struct ") && !qt.endsWith("*");
+    }
+
     private String mapPointer(String qt) {
-        // Remove trailing * and strip.
         var pointee = qt.substring(0, qt.lastIndexOf('*')).strip();
         pointee = stripQualifiers(pointee);
-
         return mapPointerToElem(pointee);
     }
 
     private String mapPointerToElem(String pointee) {
         pointee = stripQualifiers(pointee);
 
-        // void * → VoidPointer
         if (pointee.equals("void")) return "VoidPointer";
 
-        // char * → CCharPointer
         if (pointee.equals("char") || pointee.equals("signed char") ||
                 pointee.equals("unsigned char")) {
             return "CCharPointer";
         }
 
-        // uint8_t * → CCharPointer (byte-sized fixed-width types)
+        // Fixed-width pointer: uint8_t* → CCharPointer, int32_t* → CIntPointer
         var fw = FIXED_WIDTH.get(pointee);
         if (fw != null) {
             return switch (fw) {
@@ -153,27 +155,28 @@ public class TypeMapper {
             };
         }
 
-        // char ** → CCharPointerPointer
+        // char **
         if (pointee.endsWith("*")) {
-            var inner = pointee.substring(0, pointee.lastIndexOf('*')).strip();
-            inner = stripQualifiers(inner);
+            var inner = stripQualifiers(
+                    pointee.substring(0, pointee.lastIndexOf('*')).strip());
             if (inner.equals("char") || inner.equals("signed char") ||
                     inner.equals("unsigned char")) {
                 return "CCharPointerPointer";
             }
+            // struct foo ** → StructPointer (handled via @CPointerTo)
+            if (inner.startsWith("struct ")) {
+                return toPascalCase(inner.substring(7).strip()) + "Pointer";
+            }
         }
 
-        // struct * → struct type (in CInterop, pointer to struct IS the interface type)
-        if (pointee.startsWith("struct ")) {
+        // struct * → interface type
+        if (pointee.startsWith("struct "))
             return toPascalCase(pointee.substring(7).strip());
-        }
-        if (pointee.startsWith("union ")) {
+        if (pointee.startsWith("union "))
             return toPascalCase(pointee.substring(6).strip());
-        }
 
-        // Typed pointers for common primitives.
         return switch (pointee) {
-            case "int", "unsigned int" -> "CIntPointer";
+            case "int", "unsigned int", "unsigned" -> "CIntPointer";
             case "short", "unsigned short" -> "CShortPointer";
             case "long", "unsigned long", "long long", "unsigned long long" -> "CLongPointer";
             case "float" -> "CFloatPointer";
@@ -182,22 +185,18 @@ public class TypeMapper {
         };
     }
 
-    private static String stripQualifiers(String type) {
+    static String stripQualifiers(String type) {
         var t = type;
         while (true) {
             if (t.startsWith("const ")) { t = t.substring(6); continue; }
             if (t.startsWith("volatile ")) { t = t.substring(9); continue; }
             if (t.startsWith("restrict ")) { t = t.substring(9); continue; }
-            // Remove trailing const after pointer: "char *const"
             if (t.endsWith(" const")) { t = t.substring(0, t.length() - 6); continue; }
             break;
         }
         return t.strip();
     }
 
-    /**
-     * Convert a C identifier (snake_case or CamelCase) to PascalCase.
-     */
     public static String toPascalCase(String name) {
         if (name.isEmpty()) return name;
         if (!name.contains("_") && Character.isUpperCase(name.charAt(0))) return name;
@@ -211,12 +210,22 @@ public class TypeMapper {
         return sb.toString();
     }
 
-    /**
-     * Convert a C identifier to camelCase.
-     */
     public static String toCamelCase(String name) {
         var pascal = toPascalCase(name);
         if (pascal.isEmpty()) return pascal;
         return Character.toLowerCase(pascal.charAt(0)) + pascal.substring(1);
+    }
+
+    /**
+     * Extract the struct name from a double-pointer qualType, e.g.
+     * "struct point **" → "point", or null if not a double-pointer-to-struct.
+     */
+    public static String doublePointerStructName(String qualType) {
+        var qt = stripQualifiers(qualType.strip());
+        if (!qt.endsWith("**")) return null;
+        var base = stripQualifiers(qt.substring(0, qt.length() - 2).strip());
+        if (base.startsWith("struct ")) return base.substring(7).strip();
+        if (base.startsWith("union ")) return base.substring(6).strip();
+        return null;
     }
 }
