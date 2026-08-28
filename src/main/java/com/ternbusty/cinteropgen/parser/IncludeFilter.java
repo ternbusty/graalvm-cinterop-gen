@@ -5,28 +5,29 @@ import java.util.Set;
 /**
  * Selective symbol filter for cinterop-gen.
  *
- * When any include set is non-empty, the parser switches to "selective mode"
- * where file-based filtering is disabled and only matching symbols are
- * collected. Each set accepts exact names or prefix globs ending with
- * {@code *} (e.g. {@code "SYS_*"}).
+ * When any include set is non-empty the parser enters whitelist mode,
+ * accepting only declarations whose names match. When all sets are
+ * empty, every declaration is included (matching jextract's default).
  *
- * A category with an empty set produces no output for that category.
+ * Each set accepts exact names or prefix globs ending with {@code *}
+ * (e.g. {@code "SYS_*"}).
  */
 public record IncludeFilter(
         Set<String> functions,
         Set<String> structs,
+        Set<String> unions,
         Set<String> enums,
         Set<String> typedefs,
         Set<String> constants
 ) {
     public static final IncludeFilter NONE = new IncludeFilter(
-            Set.of(), Set.of(), Set.of(), Set.of(), Set.of());
+            Set.of(), Set.of(), Set.of(), Set.of(), Set.of(), Set.of());
 
-    /** True when any include list is non-empty (selective mode). */
+    /** True when any include list is non-empty (whitelist mode). */
     public boolean isSelective() {
         return !functions.isEmpty() || !structs.isEmpty()
-                || !enums.isEmpty() || !typedefs.isEmpty()
-                || !constants.isEmpty();
+                || !unions.isEmpty() || !enums.isEmpty()
+                || !typedefs.isEmpty() || !constants.isEmpty();
     }
 
     public boolean matchesFunction(String name) {
@@ -35,6 +36,10 @@ public record IncludeFilter(
 
     public boolean matchesStruct(String name) {
         return matchesAny(structs, name);
+    }
+
+    public boolean matchesUnion(String name) {
+        return matchesAny(unions, name);
     }
 
     public boolean matchesEnum(String name) {

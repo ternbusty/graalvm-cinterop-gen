@@ -14,8 +14,11 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Tests for selective include mode (--include-function, --include-struct,
- * etc.) and transitive include traversal.
+ * Tests for include filtering and transitive include traversal.
+ *
+ * Default mode includes everything reachable (matching jextract).
+ * When any --include-* flag is present, only matching declarations
+ * are collected (whitelist mode).
  */
 class SelectiveTest {
 
@@ -38,7 +41,7 @@ class SelectiveTest {
         void exactMatch() {
             var f = new IncludeFilter(
                     Set.of("sendmsg"), Set.of(), Set.of(),
-                    Set.of(), Set.of());
+                    Set.of(), Set.of(), Set.of());
             assertTrue(f.matchesFunction("sendmsg"));
             assertFalse(f.matchesFunction("recvmsg"));
         }
@@ -46,8 +49,8 @@ class SelectiveTest {
         @Test
         void prefixGlob() {
             var f = new IncludeFilter(
-                    Set.of(), Set.of(), Set.of(), Set.of(),
-                    Set.of("SYS_*"));
+                    Set.of(), Set.of(), Set.of(),
+                    Set.of(), Set.of(), Set.of("SYS_*"));
             assertTrue(f.matchesConstant("SYS_read"));
             assertTrue(f.matchesConstant("SYS_capset"));
             assertFalse(f.matchesConstant("CLONE_NEWNS"));
@@ -67,41 +70,60 @@ class SelectiveTest {
         void anyEntryMakesSelective() {
             var f = new IncludeFilter(
                     Set.of("sendmsg"), Set.of(), Set.of(),
-                    Set.of(), Set.of());
+                    Set.of(), Set.of(), Set.of());
             assertTrue(f.isSelective());
+        }
+
+        @Test
+        void unionFilterIsSelective() {
+            var f = new IncludeFilter(
+                    Set.of(), Set.of(), Set.of("number"),
+                    Set.of(), Set.of(), Set.of());
+            assertTrue(f.isSelective());
+            assertTrue(f.matchesUnion("number"));
+            assertFalse(f.matchesStruct("number"));
         }
     }
 
-    // ── Wrapper header (transitive include) ─────────────────────
+    // ── Default mode (include everything) ───────────────────────
 
     @Nested
-    class TransitiveIncludeTests {
+    class DefaultModeTests {
 
         @Test
-        void defaultModeFindsNothingInWrapper() throws Exception {
-            // wrapper.h only has #include "sample.h" and one macro.
-            // In default mode, only wrapper.h's own declarations
-            // are visible. It should find WRAPPER_EXTRA but not
-            // the declarations from sample.h.
+        void defaultModeIncludesTransitiveDeclarations()
+                throws Exception {
+            // Default mode (no filter) should see declarations from
+            // transitive #includes, matching jextract's behaviour.
             var parser = new ClangAstParser();
             var header = parser.parse(wrapperPath());
 
             var funcNames = header.functions().stream()
                     .map(Header.FunctionDecl::name).toList();
-            assertTrue(funcNames.isEmpty(),
-                    "default mode should not see sample.h functions");
+            assertTrue(funcNames.contains("sample_add"),
+                    "default mode should see sample.h functions");
+            assertTrue(funcNames.contains("sample_greet"),
+                    "default mode should see sample.h functions");
 
             var macroNames = header.constants().stream()
                     .map(Header.MacroConstant::name).toList();
             assertTrue(macroNames.contains("WRAPPER_EXTRA"),
                     "default mode should see wrapper.h's own macro");
+            assertTrue(macroNames.contains("SAMPLE_VERSION"),
+                    "default mode should see sample.h macros");
         }
+    }
+
+    // ── Whitelist mode (--include-*) ────────────────────────────
+
+    @Nested
+    class WhitelistModeTests {
 
         @Test
-        void selectiveModeFindsIncludedFunctions() throws Exception {
+        void whitelistModeFindsIncludedFunctions() throws Exception {
             var filter = new IncludeFilter(
                     Set.of("sample_add", "sample_greet"),
-                    Set.of(), Set.of(), Set.of(), Set.of());
+                    Set.of(), Set.of(), Set.of(), Set.of(), Set.of());
 
             var parser = new ClangAstParser();
             var header = parser.parse(wrapperPath(), filter);
@@ -109,18 +131,18 @@ class SelectiveTest {
             var funcNames = header.functions().stream()
                     .map(Header.FunctionDecl::name).toList();
             assertTrue(funcNames.contains("sample_add"),
-                    "selective mode should find sample_add");
+                    "whitelist mode should find sample_add");
             assertTrue(funcNames.contains("sample_greet"),
-                    "selective mode should find sample_greet");
+                    "whitelist mode should find sample_greet");
             // Should NOT contain functions not in the filter.
             assertFalse(funcNames.contains("sample_alloc"));
         }
 
         @Test
-        void selectiveModeFindsIncludedStructs() throws Exception {
+        void whitelistModeFindsIncludedStructs() throws Exception {
             var filter = new IncludeFilter(
                     Set.of(), Set.of("point"), Set.of(),
-                    Set.of(), Set.of());
+                    Set.of(), Set.of(), Set.of());
 
             var parser = new ClangAstParser();
             var header = parser.parse(wrapperPath(), filter);
@@ -128,16 +150,16 @@ class SelectiveTest {
             var structNames = header.structs().stream()
                     .map(Header.StructDecl::name).toList();
             assertTrue(structNames.contains("point"),
-                    "selective mode should find struct point");
+                    "whitelist mode should find struct point");
             assertFalse(structNames.contains("rect"),
                     "should not include rect (not in filter)");
         }
 
         @Test
-        void selectiveModeFindsIncludedEnums() throws Exception {
+        void whitelistModeFindsIncludedEnums() throws Exception {
             var filter = new IncludeFilter(
-                    Set.of(), Set.of(), Set.of("color"),
-                    Set.of(), Set.of());
+                    Set.of(), Set.of(), Set.of(),
+                    Set.of("color"), Set.of(), Set.of());
 
             var parser = new ClangAstParser();
             var header = parser.parse(wrapperPath(), filter);
@@ -145,15 +167,15 @@ class SelectiveTest {
             var enumNames = header.enums().stream()
                     .map(Header.EnumDecl::name).toList();
             assertTrue(enumNames.contains("color"),
-                    "selective mode should find enum color");
+                    "whitelist mode should find enum color");
         }
 
         @Test
-        void selectiveModeFindsAnonymousTypedefStruct()
+        void whitelistModeFindsAnonymousTypedefStruct()
                 throws Exception {
             var filter = new IncludeFilter(
                     Set.of(), Set.of("record_t"), Set.of(),
-                    Set.of(), Set.of());
+                    Set.of(), Set.of(), Set.of());
 
             var parser = new ClangAstParser();
             var header = parser.parse(wrapperPath(), filter);
@@ -161,15 +183,15 @@ class SelectiveTest {
             var structNames = header.structs().stream()
                     .map(Header.StructDecl::name).toList();
             assertTrue(structNames.contains("record_t"),
-                    "selective mode should resolve anonymous typedef struct");
+                    "whitelist mode should resolve anonymous typedef struct");
         }
 
         @Test
-        void selectiveModeFindsAnonymousTypedefEnum()
+        void whitelistModeFindsAnonymousTypedefEnum()
                 throws Exception {
             var filter = new IncludeFilter(
-                    Set.of(), Set.of(), Set.of("log_level_t"),
-                    Set.of(), Set.of());
+                    Set.of(), Set.of(), Set.of(),
+                    Set.of("log_level_t"), Set.of(), Set.of());
 
             var parser = new ClangAstParser();
             var header = parser.parse(wrapperPath(), filter);
@@ -177,15 +199,15 @@ class SelectiveTest {
             var enumNames = header.enums().stream()
                     .map(Header.EnumDecl::name).toList();
             assertTrue(enumNames.contains("log_level_t"),
-                    "selective mode should resolve anonymous typedef enum");
+                    "whitelist mode should resolve anonymous typedef enum");
         }
 
         @Test
-        void selectiveModeFindsFunctionPointerTypedef()
+        void whitelistModeFindsFunctionPointerTypedef()
                 throws Exception {
             var filter = new IncludeFilter(
                     Set.of(), Set.of(), Set.of(),
-                    Set.of("callback_fn"), Set.of());
+                    Set.of(), Set.of("callback_fn"), Set.of());
 
             var parser = new ClangAstParser();
             var header = parser.parse(wrapperPath(), filter);
@@ -193,20 +215,21 @@ class SelectiveTest {
             var fpNames = header.functionPointers().stream()
                     .map(Header.FunctionPointerDecl::name).toList();
             assertTrue(fpNames.contains("callback_fn"),
-                    "selective mode should find function pointer typedef");
+                    "whitelist mode should find function pointer typedef");
         }
     }
 
-    // ── Selective mode with macros ───────────────────────────────
+    // ── Whitelist mode with macros ───────────────────────────────
 
     @Nested
-    class SelectiveMacroTests {
+    class WhitelistMacroTests {
 
         @Test
-        void selectiveModeResolvesMacrosFromIncludedHeader()
+        void whitelistModeResolvesMacrosFromIncludedHeader()
                 throws Exception {
             var filter = new IncludeFilter(
-                    Set.of(), Set.of(), Set.of(), Set.of(),
+                    Set.of(), Set.of(), Set.of(),
+                    Set.of(), Set.of(),
                     Set.of("SAMPLE_VERSION", "MAX_NAME_LEN"));
 
             var parser = new ClangAstParser();
@@ -221,10 +244,10 @@ class SelectiveTest {
         }
 
         @Test
-        void selectiveModeGlobConstant() throws Exception {
+        void whitelistModeGlobConstant() throws Exception {
             var filter = new IncludeFilter(
-                    Set.of(), Set.of(), Set.of(), Set.of(),
-                    Set.of("SAMPLE_*"));
+                    Set.of(), Set.of(), Set.of(),
+                    Set.of(), Set.of(), Set.of("SAMPLE_*"));
 
             var parser = new ClangAstParser();
             var header = parser.parse(wrapperPath(), filter);
@@ -241,8 +264,8 @@ class SelectiveTest {
         void directMacroResolvedFromSampleHeader() throws Exception {
             // SAMPLE_VERSION is defined as "1" in sample.h.
             var filter = new IncludeFilter(
-                    Set.of(), Set.of(), Set.of(), Set.of(),
-                    Set.of("SAMPLE_VERSION"));
+                    Set.of(), Set.of(), Set.of(),
+                    Set.of(), Set.of(), Set.of("SAMPLE_VERSION"));
 
             var parser = new ClangAstParser();
             var header = parser.parse(samplePath(), filter);
@@ -254,17 +277,17 @@ class SelectiveTest {
         }
     }
 
-    // ── Codegen with selective parse ─────────────────────────────
+    // ── Codegen with whitelist parse ─────────────────────────────
 
     @Nested
-    class SelectiveCodegenTests {
+    class WhitelistCodegenTests {
 
         @Test
-        void selectiveCodegenProducesOnlyRequestedFiles()
+        void whitelistCodegenProducesOnlyRequestedFiles()
                 throws Exception {
             var filter = new IncludeFilter(
                     Set.of("sample_add"),
-                    Set.of("point"),
+                    Set.of("point"), Set.of(),
                     Set.of(), Set.of(), Set.of());
 
             var parser = new ClangAstParser();

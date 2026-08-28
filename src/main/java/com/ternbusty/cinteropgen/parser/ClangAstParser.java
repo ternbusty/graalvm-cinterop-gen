@@ -18,16 +18,21 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
  * Parse a C header by running {@code clang -Xclang -ast-dump=json} and
  * walking the resulting JSON AST.
  *
- * Macros are extracted via a regex scan of the header text in default mode,
- * or via {@code clang -dM -E} in selective mode (when an
- * {@link IncludeFilter} is active).
+ * By default every declaration reachable from the header (including
+ * transitive {@code #include}s) is collected, matching jextract's
+ * default behaviour. When an {@link IncludeFilter} with at least one
+ * non-empty set is supplied, the parser enters whitelist mode and only
+ * declarations whose names match are collected.
+ *
+ * Macro constants are always discovered via {@code clang -dM -E}.
+ * Compiler builtins are subtracted so that only macros originating
+ * from header files appear in the output.
  */
 public class ClangAstParser {
 
@@ -43,7 +48,7 @@ public class ClangAstParser {
         this.clangBinary = clangBinary;
     }
 
-    /** Parse with default file-based filtering (no selective includes). */
+    /** Parse including everything reachable (jextract default). */
     public Header parse(Path headerPath)
             throws IOException, InterruptedException {
         return parse(headerPath, IncludeFilter.NONE);
@@ -52,10 +57,9 @@ public class ClangAstParser {
     /**
      * Parse with an optional include filter.
      *
-     * When {@code filter.isSelective()} is true, file-based filtering is
-     * disabled and only symbols whose names match the filter are collected.
-     * This allows extracting declarations from transitive {@code #include}s
-     * (e.g. system headers).
+     * When {@code filter.isSelective()} is false (default), every
+     * reachable declaration is collected. When true, only declarations
+     * whose names match the filter are collected.
      */
     public Header parse(Path headerPath, IncludeFilter filter)
             throws IOException, InterruptedException {
@@ -122,33 +126,16 @@ public class ClangAstParser {
             }
         }
 
-        // clang's JSON AST only records "file" in loc for the first
-        // declaration in each file. We track this statefulness to
-        // filter system declarations in default mode.
-        String currentFile = null;
-
         for (var element : inner) {
             var node = element.getAsJsonObject();
-
-            // Track current file from loc.
-            currentFile = trackFile(node, currentFile);
-
-            // File filtering (default mode only).
-            if (!selective) {
-                if (currentFile == null
-                        || !currentFile.equals(absPath)) {
-                    continue;
-                }
-            }
-
             var kind = str(node, "kind");
+
             switch (kind) {
                 case "RecordDecl" -> {
                     var decl = parseRecord(node);
                     if (decl != null && !decl.name().isEmpty()
                             && seenStructs.add(decl.name())) {
-                        if (!selective
-                                || filter.matchesStruct(decl.name())) {
+                        if (!selective || matchesRecord(filter, decl)) {
                             structs.add(decl);
                         }
                     }
@@ -201,14 +188,7 @@ public class ClangAstParser {
         }
 
         // Macros.
-        List<MacroConstant> constants;
-        if (selective && !filter.constants().isEmpty()) {
-            constants = parseMacrosPreprocessor(headerPath, filter);
-        } else if (!selective) {
-            constants = parseMacros(headerPath);
-        } else {
-            constants = List.of();
-        }
+        var constants = extractMacros(headerPath, filter);
 
         var fileName = headerPath.getFileName().toString();
         var name = fileName.contains(".")
@@ -219,27 +199,12 @@ public class ClangAstParser {
                 typedefs, functionPointers);
     }
 
-    // ── loc tracking ─────────────────────────────────────────────
-
-    private String trackFile(JsonObject node, String current) {
-        var loc = node.getAsJsonObject("loc");
-        if (loc == null) return current;
-
-        var file = optStr(loc, "file");
-        if (file != null) return file;
-
-        var spelling = loc.getAsJsonObject("spellingLoc");
-        if (spelling != null) {
-            var f = optStr(spelling, "file");
-            if (f != null) return f;
-        }
-        var expansion = loc.getAsJsonObject("expansionLoc");
-        if (expansion != null) {
-            var f = optStr(expansion, "file");
-            if (f != null) return f;
-        }
-
-        return current;
+    /** Check whether a struct/union declaration passes the filter. */
+    private static boolean matchesRecord(
+            IncludeFilter filter, StructDecl decl) {
+        return decl.isUnion()
+                ? filter.matchesUnion(decl.name())
+                : filter.matchesStruct(decl.name());
     }
 
     // ── Record (struct / union) ──────────────────────────────────
@@ -433,10 +398,17 @@ public class ClangAstParser {
 
                 if ("RecordDecl".equals(tagKind)
                         && seenStructs.add(td.name())) {
-                    if (!selective
-                            || filter.matchesStruct(td.name())) {
-                        boolean isUnion = "union".equals(
-                                str(fullDecl, "tagUsed"));
+                    boolean isUnion = "union".equals(
+                            str(fullDecl, "tagUsed"));
+                    boolean matches;
+                    if (!selective) {
+                        matches = true;
+                    } else {
+                        matches = isUnion
+                                ? filter.matchesUnion(td.name())
+                                : filter.matchesStruct(td.name());
+                    }
+                    if (matches) {
                         var fields = parseFields(fullDecl);
                         structs.add(new StructDecl(
                                 td.name(), fields, isUnion));
@@ -496,49 +468,7 @@ public class ClangAstParser {
         return result;
     }
 
-    // ── Macro extraction (default mode) ──────────────────────────
-
-    private static final Pattern MACRO_PATTERN =
-            Pattern.compile("^\\s*#\\s*define\\s+(\\w+)\\s+(.+)$");
-
-    private List<MacroConstant> parseMacros(Path headerPath)
-            throws IOException {
-        var macros = new ArrayList<MacroConstant>();
-        for (var line : Files.readAllLines(
-                headerPath, StandardCharsets.UTF_8)) {
-            Matcher m = MACRO_PATTERN.matcher(line);
-            if (!m.matches()) continue;
-
-            var name = m.group(1);
-            var value = m.group(2).trim();
-
-            if (name.startsWith("_")
-                    || name.endsWith("_H")
-                    || name.endsWith("_H_"))
-                continue;
-            if (value.contains("(") || value.contains("\\")) continue;
-
-            var cleaned = value.replaceAll("[uUlLfF]$", "");
-            boolean isNumeric = false;
-            try {
-                Long.decode(cleaned);
-                isNumeric = true;
-            } catch (NumberFormatException e) {
-                try {
-                    Double.parseDouble(cleaned);
-                    isNumeric = true;
-                } catch (NumberFormatException e2) {
-                    // not numeric
-                }
-            }
-            if (!isNumeric && !value.startsWith("\"")) continue;
-
-            macros.add(new MacroConstant(name, value));
-        }
-        return macros;
-    }
-
-    // ── Macro extraction (selective mode via clang -dM -E) ───────
+    // ── Macro extraction (unified, via clang -dM -E) ────────────
 
     /**
      * Object-like macro line from {@code clang -dM -E}.
@@ -551,37 +481,64 @@ public class ClangAstParser {
     /**
      * Extract macro constants using the preprocessor.
      *
+     * In default mode (no filter), all macros from the header chain
+     * are collected after subtracting compiler builtins. In selective
+     * mode, only macros matching the filter are collected.
+     *
      * The resolution flow has two phases.
      *
      * Phase 1 runs {@code clang -dM -E} to discover all defined
      * object-like macros and attempts to resolve values in-memory
-     * (direct numeric literals and single-identifier indirection
-     * through the macro map).
+     * (direct numeric/float literals, string literals, and
+     * single-identifier indirection through the macro map).
      *
      * Phase 2 generates a temporary C file that assigns remaining
      * unresolved macros to {@code static const} variables, then parses
      * the resulting clang AST to read the compiler-evaluated values.
      */
-    private List<MacroConstant> parseMacrosPreprocessor(
+    private List<MacroConstant> extractMacros(
             Path headerPath, IncludeFilter filter)
             throws IOException, InterruptedException {
-        // Phase 1: discover macros via clang -dM -E.
+        boolean selective = filter.isSelective();
+
+        // In selective mode with no constant filter, skip entirely.
+        if (selective && filter.constants().isEmpty()) {
+            return List.of();
+        }
+
+        // Discover all macros via clang -dM -E.
         var macroMap = discoverMacros(headerPath);
+
+        // In default mode, subtract compiler builtins so that only
+        // macros originating from header files remain.
+        if (!selective) {
+            var builtins = discoverBuiltinMacros();
+            for (var key : builtins.keySet()) {
+                macroMap.remove(key);
+            }
+        }
 
         // Collect matching names.
         var matching = new ArrayList<String>();
         for (var name : macroMap.keySet()) {
+            // Always skip internal names and include guards.
             if (name.startsWith("_")
                     || name.endsWith("_H")
                     || name.endsWith("_H_"))
                 continue;
-            if (filter.matchesConstant(name)) {
+
+            if (selective) {
+                if (filter.matchesConstant(name)) {
+                    matching.add(name);
+                }
+            } else {
                 matching.add(name);
             }
         }
+
         if (matching.isEmpty()) return List.of();
 
-        // Try in-memory resolution first.
+        // Phase 1: try in-memory resolution.
         var resolved = new ArrayList<MacroConstant>();
         var unresolved = new ArrayList<String>();
 
@@ -643,12 +600,29 @@ public class ClangAstParser {
     }
 
     /**
+     * Discover compiler builtin macros by preprocessing an empty
+     * source. The result is used to subtract builtins from the full
+     * set discovered via the actual header file.
+     */
+    private Map<String, String> discoverBuiltinMacros()
+            throws IOException, InterruptedException {
+        var emptyFile = Files.createTempFile("cig-empty-", ".c");
+        try {
+            Files.writeString(emptyFile, "");
+            return discoverMacros(emptyFile);
+        } finally {
+            Files.deleteIfExists(emptyFile);
+        }
+    }
+
+    /**
      * Try to resolve a macro value in-memory.
      *
-     * Handles direct numeric literals (with optional C suffixes) and
-     * single-identifier indirection through the macro map.
+     * Handles direct integer/float literals (with optional C suffixes),
+     * string literals, and single-identifier indirection through the
+     * macro map.
      *
-     * Returns the resolved numeric string, or null if unresolvable.
+     * Returns the resolved value string, or null if unresolvable.
      */
     private String resolveInMemory(
             Map<String, String> macroMap, String name,
@@ -659,8 +633,8 @@ public class ClangAstParser {
 
         raw = raw.strip();
 
-        // Skip strings.
-        if (raw.startsWith("\"")) return null;
+        // String literals.
+        if (raw.startsWith("\"")) return raw;
 
         // Strip outer parentheses.
         var unwrapped = raw;
@@ -669,9 +643,17 @@ public class ClangAstParser {
                     unwrapped.length() - 1).strip();
         }
 
-        // Try as direct numeric literal.
+        // Try as direct integer literal.
         var numericValue = tryParseNumeric(unwrapped);
         if (numericValue != null) return numericValue;
+
+        // Try as floating-point literal.
+        var floatCleaned = unwrapped.replaceAll("[fFlL]+$", "");
+        try {
+            Double.parseDouble(floatCleaned);
+            return unwrapped;
+        } catch (NumberFormatException ignored) {
+        }
 
         // Try as single identifier (macro indirection).
         if (unwrapped.matches("[A-Za-z_][A-Za-z0-9_]*")) {
